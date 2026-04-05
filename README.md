@@ -1,7 +1,7 @@
-🤖 J.A.R.V.I.S — Autonomous AI Desktop Assistant with Real-Time Voice Control
+# 🤖 J.A.R.V.I.S — Autonomous AI Desktop Assistant with Real-Time Voice Control  
 
-Just A Rather Very Intelligent System
-A fully autonomous AI assistant capable of controlling an entire computer system using natural voice commands.
+> *Just A Rather Very Intelligent System*  
+> A fully autonomous AI assistant capable of controlling an entire computer system using natural voice commands.
 
 📌 Overview
 
@@ -9,11 +9,11 @@ JARVIS is a production-grade, AI-powered desktop assistant designed for real-tim
 
 It integrates:
 
-Speech Recognition
-Wake Word Detection
-AI Reasoning (Claude)
-OS-Level Automation
-GUI Visualization
+- Speech Recognition  
+- Wake Word Detection  
+- AI Reasoning (Claude)  
+- OS-Level Automation  
+- GUI Visualization  
 
 into a modular, event-driven architecture capable of executing complex, multi-step tasks across the entire system.
 
@@ -160,13 +160,13 @@ Conversational AI ↔ System Control
                     └─────────────────────────────┘
 ```
 
-🚀 Core Capabilities
-🧠 AI Decision Engine
-Claude-powered reasoning
-Context-aware interaction
-Multi-step execution
-Dynamic action mapping
+## 🚀 Core Capabilities
 
+### 🧠 AI Decision Engine
+- Claude-powered reasoning  
+- Context-aware interaction  
+- Multi-step execution  
+- Dynamic action mapping  
 Example:
 
 "Open Chrome and search for Python tutorials"
@@ -305,17 +305,15 @@ Execution	Multi-threaded
 JARVIS /
 │
 ├── brain/
-│   ├── __pycache__/
-│   │   ├── __init__.cpython-312.pyc
-│   │   ├── core.cpython-312.pyc
-│   │   ├── memory.cpython-312.pyc
+│   ├── __init__.cpython-312.pyc
+│   ├── core.cpython-312.pyc
+│   ├── memory.cpython-312.pyc
 │   │
 │   ├── __init__.py
 │   ├── core.py
 │   └── memory.py
 │
 ├── commands/
-│   ├── __pycache__/
 │   ├── __init__.py
 │   ├── keyboard.py
 │   ├── system.py
@@ -326,21 +324,18 @@ JARVIS /
 │   └── settings.py
 │
 ├── gui/
-│   ├── __pycache__/
 │   ├── __init__.py
 │   ├── animations.py
 │   └── main_window.py
 │
 ├── voice/
-│   ├── __pycache__/
 │   ├── __init__.py
 │   ├── listener.py
 │   └── speaker.py
 │
 ├── wake_word/
-│   ├── __pycache__/
-│   │   ├── __init__.cpython-312.pyc
-│   │   └── detector.cpython-312.pyc
+│   ├── __init__.cpython-312.pyc
+│   └── detector.cpython-312.pyc
 │   │
 │   ├── __init__.py
 │   └── detector.py
@@ -359,6 +354,7 @@ JARVIS /
 
 The project follows a modular architecture separating AI logic, command execution, voice processing, GUI, and wake word detection into independent components.
 ```
+```
 🔧 Installation
 git clone https://github.com/your-username/jarvis.git
 cd jarvis
@@ -367,7 +363,7 @@ Configure Microphone
 python Find mic.py
 Run
 python main.py
-
+```
 🎯 Example Commands
 Hey Jarvis weapon up  
 Hey Jarvis open chrome  
