@@ -390,6 +390,10 @@ Smart home control
 M V Karthikeya
 B.Tech CSE (AI & ML)
 
+📜 License
+
+This project is licensed under the MIT License.
+
 🏆 Final Statement
 
 JARVIS is not just a voice assistant.
