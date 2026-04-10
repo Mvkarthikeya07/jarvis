@@ -268,7 +268,7 @@ def build_app_index() -> dict:
         "music":os.path.join(U,"Music"),
         "videos":os.path.join(U,"Videos"),
         "youtube":"https://youtube.com","google":"https://google.com",
-        "gmail":"https://mail.google.com","whatsapp":"https://web.whatsapp.com",
+        "gmail":"https://mail.google.com","whatsapp":"whatsapp:",
         "instagram":"https://instagram.com","facebook":"https://facebook.com",
         "twitter":"https://twitter.com","netflix":"https://netflix.com",
         "github":"https://github.com","chatgpt":"https://chat.openai.com",
@@ -304,7 +304,7 @@ def load_apps(force=False) -> dict:
 def load_contacts() -> dict:
     if os.path.exists(CONTACTS_FILE):
         try:
-            with open(CONTACTS_FILE,encoding="utf-8") as f:
+            with open(CONTACTS_FILE, encoding="utf-8") as f:
                 return json.load(f)
         except: pass
     return {}
@@ -444,6 +444,9 @@ class DeviceController:
                 webbrowser.open(target)
             elif target.startswith("start ") or target.startswith("shell:"):
                 subprocess.Popen(target, shell=True)
+            elif target.endswith(":") and "\\" not in target and "/" not in target:
+                # Handle protocol handlers like "whatsapp:", "mailto:", etc.
+                subprocess.Popen(f'start "" "{target}"', shell=True)
             elif os.path.isdir(target):
                 subprocess.Popen(["explorer.exe", target])
             elif os.path.isfile(target):
@@ -709,6 +712,42 @@ class DeviceController:
         webbrowser.open(f"https://www.youtube.com/results?search_query={urllib.parse.quote(query)}")
         return f"Searching YouTube for {query}"
 
+    def fetch_and_read_news(self) -> str:
+        """Fetch top headlines from Google News RSS, return them as a spoken string,
+        and open Google News in the browser."""
+        headlines = []
+        try:
+            import urllib.request
+            from xml.etree import ElementTree as ET
+            url = "https://news.google.com/rss?hl=en-IN&gl=IN&ceid=IN:en"
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                raw = resp.read()
+            root = ET.fromstring(raw)
+            for item in root.iter("item"):
+                title_el = item.find("title")
+                if title_el is not None and title_el.text:
+                    # Strip source suffix like " - BBC News"
+                    title = re.sub(r'\s*-\s*[^-]+$', '', title_el.text).strip()
+                    if title:
+                        headlines.append(title)
+                if len(headlines) >= 5:
+                    break
+        except Exception as e:
+            log.warning(f"News fetch failed: {e}")
+
+        webbrowser.open("https://news.google.com/topstories")
+
+        if headlines:
+            intro = "Here are today's top headlines, sir. "
+            spoken = intro + ". ".join(
+                [f"Number {i+1}: {h}" for i, h in enumerate(headlines)]
+            ) + ". I've also opened Google News for the full stories."
+        else:
+            spoken = ("I couldn't fetch the headlines right now, sir, "
+                      "but I've opened Google News for you.")
+        return spoken
+
     # ── File operations ───────────────────────────────────────────────────────
     def create_file(self, path: str, content: str = "") -> str:
         try:
@@ -790,8 +829,18 @@ class DeviceController:
         try:
             sw, sh = pyautogui.size()
 
-            # Click the page center first to make sure the browser is focused
-            # and keyboard focus is in the content area (not address bar)
+            # Explicitly bring Chrome (or Edge/Firefox) to foreground first
+            # This fixes the issue where WhatsApp or another app has focus
+            subprocess.run(
+                'powershell -c "$w=New-Object -com wscript.shell; '
+                'if ($w.AppActivate(\'Google Chrome\')) { } '
+                'elseif ($w.AppActivate(\'Microsoft Edge\')) { } '
+                'elseif ($w.AppActivate(\'Firefox\')) { }; '
+                'Start-Sleep -Milliseconds 400"',
+                shell=True, capture_output=True)
+            time.sleep(0.5)
+
+            # Click the page center to make sure the browser content area is focused
             pyautogui.click(sw // 2, sh // 2)
             time.sleep(0.4)
 
@@ -1013,34 +1062,109 @@ class DeviceController:
         return f"Scrolled {direction}"
 
     # ── Volume / Media ────────────────────────────────────────────────────────
+    @staticmethod
+    def _vol_ps(script: str):
+        """Run a PowerShell volume script. Uses Windows Core Audio COM directly."""
+        ps = r"""
+$code = @"
+using System;
+using System.Runtime.InteropServices;
+[Guid("5CDF2C82-841E-4546-9722-0CF74078229A"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IAudioEndpointVolume {
+    int f1(); int f2(); int f3(); int f4();
+    int SetMasterVolumeLevelScalar(float fLevel, Guid pguidEventContext);
+    int f6();
+    int GetMasterVolumeLevelScalar(out float pfLevel);
+    int SetMute([MarshalAs(UnmanagedType.Bool)] bool bMute, Guid pguidEventContext);
+    int GetMute([MarshalAs(UnmanagedType.Bool)] out bool pbMute);
+}
+[Guid("D666063F-1587-4E43-81F1-B948E807363F"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDevice {
+    int Activate(ref Guid iid, uint dwClsCtx, IntPtr pActivationParams, [MarshalAs(UnmanagedType.IUnknown)] out object ppInterface);
+}
+[Guid("A95664D2-9614-4F35-A746-DE8DB63617E6"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+interface IMMDeviceEnumerator {
+    int EnumAudioEndpoints(int dataFlow, uint dwStateMask, out IntPtr ppDevices);
+    int GetDefaultAudioEndpoint(int dataFlow, int role, out IMMDevice ppEndpoint);
+}
+[ComImport, Guid("BCDE0395-E52F-467C-8E3D-C4579291692E")]
+class MMDeviceEnumeratorClass {}
+public class Vol {
+    public static IAudioEndpointVolume GetEP() {
+        var en = (IMMDeviceEnumerator)new MMDeviceEnumeratorClass();
+        IMMDevice dev; en.GetDefaultAudioEndpoint(0, 1, out dev);
+        var iid = typeof(IAudioEndpointVolume).GUID;
+        object o; dev.Activate(ref iid, 23, IntPtr.Zero, out o);
+        return (IAudioEndpointVolume)o;
+    }
+    public static void Set(float v) { GetEP().SetMasterVolumeLevelScalar(v, Guid.Empty); }
+    public static float Get()       { float v; GetEP().GetMasterVolumeLevelScalar(out v); return v; }
+    public static void Mute(bool m) { GetEP().SetMute(m, Guid.Empty); }
+    public static bool IsMuted()    { bool m; GetEP().GetMute(out m); return m; }
+}
+"@
+if (-not ([System.Management.Automation.PSTypeName]'Vol').Type) {
+    Add-Type -TypeDefinition $code
+}
+""" + script
+        try:
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip()
+        except Exception as e:
+            log.warning(f"Volume PS error: {e}")
+            return ""
+
     def volume_up(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]175)"',
-                       shell=True, capture_output=True)
-        return "Volume increased"
+        out = self._vol_ps(
+            "$cur=[Vol]::Get(); $nv=[math]::Min(1.0,$cur+0.10); [Vol]::Set($nv); Write-Output ([math]::Round($nv*100))"
+        )
+        level = out if out.isdigit() else "higher"
+        return f"Volume increased to {level}"
 
     def volume_down(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]174)"',
-                       shell=True, capture_output=True)
-        return "Volume decreased"
+        out = self._vol_ps(
+            "$cur=[Vol]::Get(); $nv=[math]::Max(0.0,$cur-0.10); [Vol]::Set($nv); Write-Output ([math]::Round($nv*100))"
+        )
+        level = out if out.isdigit() else "lower"
+        return f"Volume decreased to {level}"
 
     def mute(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]173)"',
-                       shell=True, capture_output=True)
+        self._vol_ps("$m=[Vol]::IsMuted(); [Vol]::Mute(-not $m)")
         return "Toggled mute"
 
+    def set_volume(self, level: int) -> str:
+        """Set system volume to an exact level 0-100 using Windows Core Audio API."""
+        level = max(0, min(100, level))
+        out = self._vol_ps(
+            f"[Vol]::Set({level/100:.2f}f); $v=[Vol]::Get(); Write-Output ([math]::Round($v*100))"
+        )
+        actual = out if out.isdigit() else str(level)
+        return f"Volume set to {actual} percent"
+
     def media_play_pause(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]179)"',
-                       shell=True, capture_output=True)
+        subprocess.run(
+            'powershell -c "Add-Type -A System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait(\'{MEDIA_PLAY_PAUSE}\')"',
+            shell=True, capture_output=True)
+        # Fallback using keybd_event VK code 0xB3
+        subprocess.run(
+            'powershell -c "$sig=\'[DllImport(\\\"user32.dll\\\")]public static extern void keybd_event(byte b,byte s,int f,int e);\'; '
+            'Add-Type -M $sig -N KB; [KB]::keybd_event(0xB3,0,0,0); [KB]::keybd_event(0xB3,0,2,0)"',
+            shell=True, capture_output=True)
         return "Play/Pause"
 
     def media_next(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]176)"',
-                       shell=True, capture_output=True)
+        subprocess.run(
+            'powershell -c "$sig=\'[DllImport(\\\"user32.dll\\\")]public static extern void keybd_event(byte b,byte s,int f,int e);\'; '
+            'Add-Type -M $sig -N KB2; [KB2]::keybd_event(0xB0,0,0,0); [KB2]::keybd_event(0xB0,0,2,0)"',
+            shell=True, capture_output=True)
         return "Next track"
 
     def media_prev(self) -> str:
-        subprocess.run('powershell -c "$w=New-Object -com wscript.shell;$w.SendKeys([char]177)"',
-                       shell=True, capture_output=True)
+        subprocess.run(
+            'powershell -c "$sig=\'[DllImport(\\\"user32.dll\\\")]public static extern void keybd_event(byte b,byte s,int f,int e);\'; '
+            'Add-Type -M $sig -N KB3; [KB3]::keybd_event(0xB1,0,0,0); [KB3]::keybd_event(0xB1,0,2,0)"',
+            shell=True, capture_output=True)
         return "Previous track"
 
     # ── Screenshot ────────────────────────────────────────────────────────────
@@ -1083,31 +1207,178 @@ class DeviceController:
                  if p.info["name"] and not p.info["name"].startswith("System")][:15]
         return "Running: " + ", ".join(procs)
 
-    # ── Contacts / Calls ──────────────────────────────────────────────────────
-    def call_contact(self, name: str) -> str:
-        match = self._find_contact(name)
-        if match:
-            contact_name, number = match
-            webbrowser.open(f"https://web.whatsapp.com/send?phone={number}")
-            return f"Calling {contact_name} on WhatsApp"
-        return f"I couldn't find {name} in your contacts. Run contacts_manager.py to add them."
+    # ── WhatsApp automation ───────────────────────────────────────────────────
+    def _wa_sendkeys(self, keys: str):
+        cmd = f"$w=New-Object -com wscript.shell; $w.SendKeys('{keys}')"
+        subprocess.run(['powershell', '-c', cmd], capture_output=True)
 
-    def message_contact(self, name: str, message: str = "") -> str:
-        match = self._find_contact(name)
-        if match:
-            contact_name, number = match
-            url = (f"https://web.whatsapp.com/send?phone={number}"
-                   + (f"&text={urllib.parse.quote(message)}" if message else ""))
-            webbrowser.open(url)
-            return f"Opening WhatsApp to message {contact_name}"
-        return f"I couldn't find {name} in your contacts."
+    def _wa_activate(self):
+        ps = r"""
+$p = Get-Process | Where-Object { $_.MainWindowTitle -eq 'WhatsApp' } | Select-Object -First 1
+if ($p) {
+    Add-Type @'
+using System; using System.Runtime.InteropServices;
+public class WF2 {
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+}
+'@ -ErrorAction SilentlyContinue
+    [WF2]::ShowWindow($p.MainWindowHandle, 9)
+    [WF2]::SetForegroundWindow($p.MainWindowHandle)
+    Start-Sleep -Milliseconds 800
+    Write-Output 'ok'
+}
+"""
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=8)
+        return "ok" in r.stdout
+
+    def _wa_click(self, x: int, y: int, label: str = ""):
+        log.info(f"  [WA] click {label} ({x},{y})")
+        if PYAUTOGUI:
+            pyautogui.moveTo(x, y, duration=0.15)
+            pyautogui.click()
+        time.sleep(0.5)
+
+    def _wa_paste(self, text: str):
+        """Set clipboard then Ctrl+V — only reliable input method for Electron."""
+        ps_escaped = text.replace('"', '`"')
+        subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             f'Set-Clipboard -Value "{ps_escaped}"'],
+            capture_output=True)
+        time.sleep(0.3)
+        self._wa_sendkeys('^v')
+        time.sleep(0.4)
+
+    def _wa_open_and_search(self, name: str):
+        """Launch WhatsApp and search for contact by typing name."""
+        subprocess.Popen('start "" "whatsapp:"', shell=True)
+        time.sleep(5)
+        if not self._wa_activate():
+            time.sleep(3)
+            self._wa_activate()
+        time.sleep(0.5)
+        # Use Ctrl+F to focus search
+        self._wa_sendkeys('^f')
+        time.sleep(0.8)
+        # Type the contact name
+        self._wa_paste(name)
+        time.sleep(2.5)
+        # Press Down arrow to select first result and Enter to open chat
+        self._wa_sendkeys('{DOWN}')
+        time.sleep(0.5)
+        self._wa_sendkeys('{ENTER}')
+        time.sleep(2.0)
 
     def _find_contact(self, spoken: str):
         spoken = spoken.lower().strip()
-        if spoken in self.contacts: return spoken, self.contacts[spoken]
-        for name,number in self.contacts.items():
-            if spoken in name or name in spoken: return name, number
+        if spoken in self.contacts:
+            return spoken, self.contacts[spoken]
+        for name, number in self.contacts.items():
+            if spoken in name or name in spoken:
+                return name, number
         return None
+
+    def call_contact(self, name: str) -> str:
+        """Look up number in contacts.json and call via WhatsApp.
+        If contact is not found in contacts.json, report no contact found."""
+        match = self._find_contact(name)
+        if not match:
+            return f"No contact found on that name"
+        contact_name, number = match
+        
+        # Step 1 — Launch WhatsApp desktop app and bring it to foreground
+        subprocess.Popen('start "" "whatsapp:"', shell=True)
+        time.sleep(5)
+        if not self._wa_activate():
+            time.sleep(3)
+            self._wa_activate()
+        time.sleep(0.5)
+
+        # Step 2 — Use Ctrl+F to focus search and type the contact's name
+        self._wa_sendkeys('^f')
+        time.sleep(0.8)
+        self._wa_paste(contact_name)
+        time.sleep(2.5)
+
+        # Step 3 — Press Down arrow to highlight the first contact result,
+        # then Enter to open their chat
+        self._wa_sendkeys('{DOWN}')
+        time.sleep(0.5)
+        self._wa_sendkeys('{ENTER}')
+        time.sleep(2.0)
+
+        # Step 4 — Click the call button (voice call icon in top right of chat)
+        # Call button is typically around x=1200-1220, y=40-50 on 1366x768 screen
+        if PYAUTOGUI:
+            pyautogui.click(1215, 45)
+            time.sleep(1.0)
+        
+        log.info(f"  [WA] calling {contact_name}")
+        return f"Calling {contact_name} on WhatsApp, sir."
+
+    def message_contact(self, name: str, message: str = "") -> str:
+        """Open WhatsApp app, search for the contact by name, then type and send the message."""
+
+        # Step 1 — Launch WhatsApp desktop app and bring it to foreground
+        subprocess.Popen('start "" "whatsapp:"', shell=True)
+        time.sleep(5)
+        if not self._wa_activate():
+            time.sleep(3)
+            self._wa_activate()
+        time.sleep(0.5)
+
+        # Step 2 — Use Ctrl+F to focus search and type the contact's name
+        self._wa_sendkeys('^f')
+        time.sleep(0.8)
+        self._wa_paste(name)
+        time.sleep(2.5)
+
+        # Step 3 — Press Down arrow to highlight the first contact result,
+        # then Enter to open their chat
+        self._wa_sendkeys('{DOWN}')
+        time.sleep(0.5)
+        self._wa_sendkeys('{ENTER}')
+        time.sleep(2.0)
+
+        if not message:
+            return f"Opened WhatsApp chat with {name}, sir."
+
+        # Step 4 — Make sure WhatsApp still has focus
+        self._wa_activate()
+        time.sleep(0.3)
+
+        # Step 5 — Type message and send using keyboard
+        self._wa_paste(message)
+        time.sleep(0.4)
+
+        # Step 6 — Press Enter to send
+        self._wa_sendkeys('{ENTER}')
+        time.sleep(0.3)
+
+        log.info(f"  [WA] sent '{message}' to {name}")
+        return f"I've sent '{message}' to {name} on WhatsApp, sir."
+
+    # ── YouTube search and play ───────────────────────────────────────────────
+    def play_youtube_video(self, video_name: str) -> str:
+        """Open YouTube search results and play the first video."""
+        # Construct YouTube search URL directly
+        search_url = f"https://www.youtube.com/results?search_query={urllib.parse.quote(video_name)}"
+        webbrowser.open(search_url)
+        time.sleep(5)  # Wait for search results to load
+        
+        # Move mouse to first video thumbnail (main content area, not sidebar)
+        if PYAUTOGUI:
+            # First video thumbnail is in the main area around x=400, y=300
+            pyautogui.moveTo(400, 300, duration=0.5)
+            time.sleep(0.5)
+            # Click on it
+            pyautogui.click()
+            time.sleep(3)
+        
+        log.info(f"  [YT] playing '{video_name}'")
+        return f"Playing {video_name} on YouTube, sir."
 
     # ── System control ────────────────────────────────────────────────────────
     def shutdown(self, delay=10) -> str:
@@ -1426,6 +1697,26 @@ class AIBrain:
             self.speaker.say(result)
             return result
 
+        # ── Pre-AI intercept: YouTube play video (BEFORE page navigation) ─────
+        # Must come before generic play/pause to override it
+        yt_match = re.match(
+            r'^(?:play|search for|find on youtube)\s+(?:the\s+)?(.+?)(?:\s+(?:on youtube|in youtube|youtube|song|video|music))?$',
+            cmd_clean, re.IGNORECASE
+        )
+        if yt_match and not re.search(r'\b(first|second|third|1st|2nd|3rd|video \d|item \d)\b', cmd_clean, re.IGNORECASE):
+            video_name = yt_match.group(1).strip().strip('"\'')
+            video_name = re.sub(r'\b(please|now|on youtube|in youtube|youtube)\b', '',
+                                video_name, flags=re.IGNORECASE).strip()
+            # Only proceed if we have a meaningful search term (more than 1 word or not "play")
+            if len(video_name) > 0 and video_name.lower() not in ["play", "pause", "resume"]:
+                log.info(f"  [YT intercept] video='{video_name}'")
+                self.speaker.say_and_wait(
+                    f"Opening YouTube and searching for {video_name}. Please wait.", extra=0.3)
+                result = self.device.play_youtube_video(video_name)
+                log.info(f"  [YT intercept] → {result}")
+                self.speaker.say(result)
+                return result
+
         # ── Pre-AI intercept: page / keyboard / file actions ─────────────────
         # These MUST never reach the AI or they'll be turned into searches.
         c_pg = cmd_clean.lower()
@@ -1658,6 +1949,44 @@ class AIBrain:
             log.info(f"  [TYPE_IN] → {result}")
             return result
 
+        # ── Pre-AI intercept: WhatsApp send message ──────────────────────────
+        # Patterns: "send hi to mom", "text good morning to john",
+        #           "message hey there to alice", "whatsapp hi to dad"
+        wa_match = re.match(
+            r'^(?:send|text|message|whatsapp|ping|drop)\s+(.+?)\s+(?:to|for)\s+(.+)$',
+            cmd_clean, re.IGNORECASE
+        )
+        if wa_match:
+            msg_text    = wa_match.group(1).strip().strip('"\'')
+            person_name = wa_match.group(2).strip().strip('"\'')
+            person_name = re.sub(r'\b(on whatsapp|via whatsapp|please|now)\b', '',
+                                 person_name, flags=re.IGNORECASE).strip()
+            log.info(f"  [WA intercept] msg='{msg_text}' to='{person_name}'")
+            self.speaker.say_and_wait(
+                f"Opening WhatsApp and searching for {person_name}. Please wait.", extra=0.3)
+            result = self.device.message_contact(person_name, msg_text)
+            log.info(f"  [WA intercept] → {result}")
+            self.speaker.say(result)
+            return result
+
+        # ── Pre-AI intercept: WhatsApp call ──────────────────────────────────
+        call_match = re.match(
+            r'^(?:call|ring|phone|whatsapp call)\s+(.+)$',
+            cmd_clean, re.IGNORECASE
+        )
+        if call_match:
+            person_name = call_match.group(1).strip().strip('"\'')
+            person_name = re.sub(r'\b(on whatsapp|via whatsapp|please|now)\b', '',
+                                 person_name, flags=re.IGNORECASE).strip()
+            log.info(f"  [CALL intercept] person='{person_name}'")
+            self.speaker.say_and_wait(
+                f"Opening WhatsApp and searching for {person_name}.", extra=0.3)
+            result = self.device.call_contact(person_name)
+            log.info(f"  [CALL intercept] → {result}")
+            self.speaker.say(result)
+            return result
+
+
         # ── Pre-AI intercept: casual conversation (never search these) ────────
         c_lower = cmd_clean.lower().strip()
         _CONVO = {
@@ -1687,6 +2016,9 @@ class AIBrain:
         }
         for triggers, reply in _CONVO.items():
             if any(c_lower == t or c_lower.startswith(t) for t in triggers):
+                # Don't treat "hi to X" or "hello to X" as a greeting — it's a message command
+                if re.search(r'^(hi|hey|hello)\s+\w', c_lower) and re.search(r'\bto\b', c_lower):
+                    break
                 if reply is None:
                     # Time-aware greeting
                     h = datetime.datetime.now().hour
@@ -1696,6 +2028,35 @@ class AIBrain:
                 log.info(f"  [CONVO intercept] → {reply}")
                 self.speaker.say(reply)
                 return reply
+
+        # ── Pre-AI intercept: global news ────────────────────────────────────
+        if re.search(
+            r'\b(what(?:\'?s| is) happening (in the world|today|right now|out there)|'
+            r'today(?:\'?s)? news|latest news|top news|world news|current news|'
+            r'news today|what(?:\'?s| is) in the news|show me the news|'
+            r'open (the )?news|global news|headlines today|top headlines)\b',
+            cmd_clean, re.IGNORECASE
+        ):
+            self.speaker.say_and_wait(
+                "Fetching today's top headlines for you, sir. One moment.", extra=0.3)
+            result = self.device.fetch_and_read_news()
+            log.info(f"  [NEWS intercept] -> {result}")
+            self.speaker.say(result)
+            return result
+
+        # ── Pre-AI intercept: set volume to exact level ──────────────────────
+        vol_match = re.search(
+            r'\b(?:set|put|change|turn|make|increase|raise|lower|decrease|reduce|bring)\s+(?:the\s+)?volume\s+(?:to|at|on|up\s+to|down\s+to)?\s*(\d{1,3})'
+            r'|\bvolume\s+(?:to\s+)?(\d{1,3})(?:\s*percent)?\b',
+            cmd_clean, re.IGNORECASE
+        )
+        if vol_match:
+            raw_level = vol_match.group(1) or vol_match.group(2)
+            level = int(raw_level)
+            result = self.device.set_volume(level)
+            log.info(f"  [VOLUME SET intercept] level={level} → {result}")
+            self.speaker.say(f"Volume set to {level} percent, sir.")
+            return result
 
         # Get AI response
         ai_text = self._ask_ai(cmd)
@@ -2148,7 +2509,14 @@ class WakeDetector:
                 if any(wp in heard for wp in WAKE_PHRASES):
                     log.info("✅ Wake phrase confirmed — activating!")
                     cooldown_until = time.time() + self.COOLDOWN_SEC
-                    threading.Thread(target=self._on_wake, daemon=True).start()
+                    # Extract any inline command spoken after the wake phrase
+                    inline = heard
+                    for wp in sorted(WAKE_PHRASES, key=len, reverse=True):
+                        if wp in inline:
+                            inline = inline[inline.index(wp) + len(wp):].strip(", .")
+                            break
+                    inline_cmd = inline if len(inline) > 2 else None
+                    threading.Thread(target=self._on_wake, args=(inline_cmd,), daemon=True).start()
 
             except Exception as e:
                 log.error(f"WakeDetector loop error: {e}")
@@ -2261,75 +2629,91 @@ class JarvisGUI:
         self.response_var.set(sub)
 
     def _tick(self):
-        self._t += 0.04; self._draw(); self.win.after(35, self._tick)
+        try:
+            self._t += 0.04
+            self._draw()
+            self.win.after(35, self._tick)
+        except (KeyboardInterrupt, tk.TclError, RuntimeError):
+            pass  # Suppress GUI animation errors
+        except Exception as e:
+            log.warning(f"GUI tick error: {e}")
 
     def _draw(self):
-        c=self.canvas; cx,cy,r=self._cx,self._cy,self._r; c.delete("all")
-        t=self._t
+        try:
+            c=self.canvas; cx,cy,r=self._cx,self._cy,self._r
+            try:
+                c.delete("all")
+            except (tk.TclError, RuntimeError):
+                return  # Canvas is being destroyed
+            t=self._t
 
-        # Outer HUD rings always present
-        for i,col in enumerate(["#001122","#001833","#002244"]):
-            rr = r+40+i*18
-            c.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,outline=col,width=1)
+            # Outer HUD rings always present
+            for i,col in enumerate(["#001122","#001833","#002244"]):
+                rr = r+40+i*18
+                c.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,outline=col,width=1)
 
-        # Rotating tick marks on outer ring
-        for i in range(36):
-            angle = math.pi*2*i/36 + t*0.3
-            inner = r+44; outer_r = r+50 if i%3==0 else r+47
-            c.create_line(cx+math.cos(angle)*inner, cy+math.sin(angle)*inner,
-                          cx+math.cos(angle)*outer_r, cy+math.sin(angle)*outer_r,
-                          fill="#003366" if i%3!=0 else "#005599", width=1)
+            # Rotating tick marks on outer ring
+            for i in range(36):
+                angle = math.pi*2*i/36 + t*0.3
+                inner = r+44; outer_r = r+50 if i%3==0 else r+47
+                c.create_line(cx+math.cos(angle)*inner, cy+math.sin(angle)*inner,
+                              cx+math.cos(angle)*outer_r, cy+math.sin(angle)*outer_r,
+                              fill="#003366" if i%3!=0 else "#005599", width=1)
 
-        if self._state == self.IDLE:
-            # Slow breathing blue orb
-            pulse = r + 4*math.sin(t*1.2)
-            self._glow(cx,cy,pulse,"#000819","#001433","#0077aa")
-            # Crosshair lines
-            c.create_line(cx-pulse-5,cy,cx+pulse+5,cy,fill="#003355",width=1,dash=(2,4))
-            c.create_line(cx,cy-pulse-5,cx,cy+pulse+5,fill="#003355",width=1,dash=(2,4))
-            # Center dot
-            c.create_oval(cx-4,cy-4,cx+4,cy+4,fill="#00aacc",outline="")
+            if self._state == self.IDLE:
+                # Slow breathing blue orb
+                pulse = r + 4*math.sin(t*1.2)
+                self._glow(cx,cy,pulse,"#000819","#001433","#0077aa")
+                # Crosshair lines
+                c.create_line(cx-pulse-5,cy,cx+pulse+5,cy,fill="#003355",width=1,dash=(2,4))
+                c.create_line(cx,cy-pulse-5,cx,cy+pulse+5,fill="#003355",width=1,dash=(2,4))
+                # Center dot
+                c.create_oval(cx-4,cy-4,cx+4,cy+4,fill="#00aacc",outline="")
 
-        elif self._state == self.LISTENING:
-            pulse = r + 12*math.sin(t*5)
-            self._glow(cx,cy,pulse,"#001a33","#003366","#00D4FF")
-            # Sound wave bars
-            for i in range(32):
-                angle = math.pi*2*i/32
-                bh = 15+18*abs(math.sin(t*7+i*0.5))
-                col = "#00FF99" if abs(math.sin(t*7+i*0.5))>0.7 else "#00D4FF"
-                x1=cx+math.cos(angle)*(pulse+6); y1=cy+math.sin(angle)*(pulse+6)
-                x2=cx+math.cos(angle)*(pulse+6+bh); y2=cy+math.sin(angle)*(pulse+6+bh)
-                c.create_line(x1,y1,x2,y2,fill=col,width=3,capstyle=tk.ROUND)
-            c.create_oval(cx-5,cy-5,cx+5,cy+5,fill="#00FF99",outline="")
+            elif self._state == self.LISTENING:
+                pulse = r + 12*math.sin(t*5)
+                self._glow(cx,cy,pulse,"#001a33","#003366","#00D4FF")
+                # Sound wave bars
+                for i in range(32):
+                    angle = math.pi*2*i/32
+                    bh = 15+18*abs(math.sin(t*7+i*0.5))
+                    col = "#00FF99" if abs(math.sin(t*7+i*0.5))>0.7 else "#00D4FF"
+                    x1=cx+math.cos(angle)*(pulse+6); y1=cy+math.sin(angle)*(pulse+6)
+                    x2=cx+math.cos(angle)*(pulse+6+bh); y2=cy+math.sin(angle)*(pulse+6+bh)
+                    c.create_line(x1,y1,x2,y2,fill=col,width=3,capstyle=tk.ROUND)
+                c.create_oval(cx-5,cy-5,cx+5,cy+5,fill="#00FF99",outline="")
 
-        elif self._state == self.PROCESSING:
-            self._glow(cx,cy,r,"#1a0a00","#331500","#FF6B00")
-            # Spinning arcs
-            for i in range(4):
-                start = math.degrees(t*(3+i*0.7) % (math.pi*2))
-                c.create_arc(cx-r-i*12,cy-r-i*12,cx+r+i*12,cy+r+i*12,
-                             start=start, extent=90,
-                             outline=["#FF6B00","#FF8800","#FFaa00","#FFcc44"][i],
-                             width=3, style=tk.ARC)
-            # Pulsing center
-            pr = 8+4*math.sin(t*8)
-            c.create_oval(cx-pr,cy-pr,cx+pr,cy+pr,fill="#FF6B00",outline="")
+            elif self._state == self.PROCESSING:
+                self._glow(cx,cy,r,"#1a0a00","#331500","#FF6B00")
+                # Spinning arcs
+                for i in range(4):
+                    start = math.degrees(t*(3+i*0.7) % (math.pi*2))
+                    c.create_arc(cx-r-i*12,cy-r-i*12,cx+r+i*12,cy+r+i*12,
+                                 start=start, extent=90,
+                                 outline=["#FF6B00","#FF8800","#FFaa00","#FFcc44"][i],
+                                 width=3, style=tk.ARC)
+                # Pulsing center
+                pr = 8+4*math.sin(t*8)
+                c.create_oval(cx-pr,cy-pr,cx+pr,cy+pr,fill="#FF6B00",outline="")
 
-        elif self._state == self.SPEAKING:
-            pulse = r+14*math.sin(t*3)
-            self._glow(cx,cy,pulse,"#001a00","#003300","#00FF77")
-            # Ripple rings
-            for i in range(4):
-                rr=pulse+16+i*20+8*math.sin(t*2.5-i*0.8)
-                alpha = ["#00FF77","#00DD66","#00BB55","#009944"][i]
-                c.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,outline=alpha,width=2)
-            # Voice bars at bottom
-            for i in range(12):
-                x = cx - 55 + i*10
-                bh = 6+14*abs(math.sin(t*6+i*0.6))
-                c.create_rectangle(x,cy+pulse+8,x+6,cy+pulse+8+bh,
-                                   fill="#00FF88",outline="")
+            elif self._state == self.SPEAKING:
+                pulse = r+14*math.sin(t*3)
+                self._glow(cx,cy,pulse,"#001a00","#003300","#00FF77")
+                # Ripple rings
+                for i in range(4):
+                    rr=pulse+16+i*20+8*math.sin(t*2.5-i*0.8)
+                    alpha = ["#00FF77","#00DD66","#00BB55","#009944"][i]
+                    c.create_oval(cx-rr,cy-rr,cx+rr,cy+rr,outline=alpha,width=2)
+                # Voice bars at bottom
+                for i in range(12):
+                    x = cx - 55 + i*10
+                    bh = 6+14*abs(math.sin(t*6+i*0.6))
+                    c.create_rectangle(x,cy+pulse+8,x+6,cy+pulse+8+bh,
+                                       fill="#00FF88",outline="")
+        except (tk.TclError, RuntimeError, KeyboardInterrupt):
+            pass  # Suppress canvas errors gracefully
+        except Exception as e:
+            log.warning(f"Draw error: {e}")
 
     def _glow(self,cx,cy,r,c1,c2,c3):
         c=self.canvas
@@ -2357,20 +2741,25 @@ class Jarvis:
         self.wake     = WakeDetector(on_wake=self.activate, speaker=self.speaker)
         self._busy    = False
 
-    def activate(self):
+    def activate(self, inline_cmd: str = None):
         if self._busy: return
-        threading.Thread(target=self._session, daemon=True).start()
+        threading.Thread(target=self._session, args=(inline_cmd,), daemon=True).start()
 
-    def _session(self):
+    def _session(self, inline_cmd: str = None):
         self._busy = True
         try:
             self.gui.set_listening()
-            self.speaker.say_and_wait("Yes?", extra=0.4)
 
-            text = self.listener.listen_once(timeout=8)
-            if not text:
-                self.speaker.say("I didn't catch that. Try again.")
-                return
+            if inline_cmd:
+                # Command was spoken in the same breath as the wake phrase — use it directly
+                text = inline_cmd
+                log.info(f"Inline cmd from wake: '{text}'")
+            else:
+                self.speaker.say_and_wait("Yes?", extra=0.4)
+                text = self.listener.listen_once(timeout=8)
+                if not text:
+                    self.speaker.say("I didn't catch that. Try again.")
+                    return
 
             self.gui.set_processing(text)
             response = self.brain.handle(text)
@@ -2410,4 +2799,4 @@ if __name__ == "__main__":
         print("\nJarvis offline.")
     except Exception as e:
         log.critical(f"Fatal: {e}", exc_info=True)
-        input("Press Enter to exit...")
+        input("Press Enter to exit...") 
